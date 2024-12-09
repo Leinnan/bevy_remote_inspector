@@ -1,17 +1,19 @@
 use bevy::{
     prelude::Entity,
     remote::{
-        builtin_methods::{BrpQuery, BrpQueryFilter, BrpQueryParams, BRP_QUERY_METHOD},
+        builtin_methods::{
+            BrpDestroyParams, BrpQuery, BrpQueryFilter, BrpQueryParams, BrpQueryRow, BRP_DESTROY_METHOD, BRP_LIST_METHOD, BRP_QUERY_METHOD
+        },
         http::{DEFAULT_ADDR, DEFAULT_PORT},
-        BrpRequest,
     },
     utils::HashMap,
 };
 use eframe::egui::{self, ViewportCommand};
 use egui::{Color32, RichText};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::{Arc, Mutex};
+
+use crate::helper;
 
 /// The response to a `bevy/query` request.
 pub type BrpQueryResponse = Vec<BrpQueryRow>;
@@ -26,19 +28,6 @@ impl ToHashMap for BrpQueryResponse {
     }
 }
 
-/// One query match result: a single entity paired with the requested components.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BrpQueryRow {
-    /// The ID of the entity that matched.
-    pub entity: Entity,
-
-    /// The serialized values of the requested components.
-    pub components: HashMap<String, Value>,
-
-    /// The boolean-only containment query results.
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-    pub has: HashMap<String, Value>,
-}
 enum Download {
     None,
     InProgress,
@@ -50,6 +39,8 @@ enum Download {
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
 pub struct TemplateApp {
     #[serde(skip)] // This how you opt-out of serialization of a field
+    query_list: Arc<Mutex<Option<BrpQueryParams>>>,
+    #[serde(skip)] // This how you opt-out of serialization of a field
     download: Arc<Mutex<Download>>,
     #[serde(skip)]
     components: Arc<Mutex<HashMap<Entity, BrpQueryRow>>>,
@@ -58,10 +49,18 @@ pub struct TemplateApp {
     error_info: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum ActionToDo {
+    #[default]
+    None,
+    Remove,
+}
+
 impl Default for TemplateApp {
     fn default() -> Self {
         Self {
             download: Arc::new(Mutex::new(Download::None)),
+            query_list: Arc::new(Mutex::new(None)),
             components: Arc::new(Mutex::new(HashMap::new())),
             skip_empty_entities: true,
             error_info: Arc::new(Mutex::new(None)),
@@ -85,18 +84,60 @@ impl TemplateApp {
         Default::default()
     }
 
+    fn get_url(&self) -> String {
+        let host_part = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT);
+        let url = format!("http://{}/", host_part);
+        url
+    }
+
+    fn fetch_list(&self) {
+        let download_store = self.download.clone();
+        let error_info = self.error_info.clone();
+        let query_param = self.query_list.clone();
+        *download_store.lock().unwrap() = Download::InProgress;
+
+        let request = helper::make_empty_request(BRP_LIST_METHOD, self.get_url());
+        ehttp::fetch(request, move |response| {
+            *download_store.lock().unwrap() = Download::Done;
+            let Ok(response) = response else {
+                *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
+                // egui_ctx.request_repaint();
+                return;
+            };
+            if !response.ok {
+                *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
+                return;
+            }
+            let Ok(type_list) = helper::parse(&response) else {
+                *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
+                return;
+            };
+
+            *query_param.lock().unwrap() = Some(BrpQueryParams {
+                data: BrpQuery {
+                    components: vec![],
+                    option: type_list,
+                    has: vec![],
+                },
+                filter: BrpQueryFilter::default(),
+            });
+            *error_info.lock().unwrap() = None;
+        });
+    }
+
     fn draw_entity(
         &self,
         ui: &mut egui::Ui,
         entity: &Entity,
         components: &HashMap<Entity, BrpQueryRow>,
-    ) {
+    ) -> ActionToDo {
+        let mut action = ActionToDo::None;
         let Some(item) = components.get(entity) else {
-            return;
+            return action;
         };
         let is_empty = item.components.len() == 0;
         if self.skip_empty_entities && is_empty {
-            return;
+            return action;
         }
         let mut id = entity.to_string();
         if let Some(name) = item.components.get("bevy_core::name::Name") {
@@ -109,6 +150,9 @@ impl TemplateApp {
         egui::CollapsingHeader::new(RichText::new(id).strong())
             .default_open(false)
             .show(ui, |ui| {
+                if ui.button("Remove entity").clicked() {
+                    action = ActionToDo::Remove;
+                }
                 if let Some(children) = item
                     .components
                     .get("bevy_hierarchy::components::children::Children")
@@ -149,6 +193,7 @@ impl TemplateApp {
                 }
             });
         ui.separator();
+        return action;
     }
 }
 
@@ -181,142 +226,49 @@ impl eframe::App for TemplateApp {
             //     );
             // });
             ui.horizontal(|ui| {
-                    let download_store = self.download.clone();
-                    let is_downloading = matches!(&*download_store.lock().unwrap(), Download::InProgress);
-                    ui.add_space(8.0);
-                    ui.add_enabled_ui(!is_downloading, |ui|{
+                let download_store = self.download.clone();
+                let is_downloading =
+                    matches!(&*download_store.lock().unwrap(), Download::InProgress);
+                let query_param = self.query_list.clone();
+                let has_query = query_param.lock().unwrap().is_some();
+                if !is_downloading && !has_query {
+                    self.fetch_list();
+                }
+                ui.add_space(8.0);
+                ui.add_enabled_ui(!is_downloading && has_query, |ui| {
+                    if ui.button("Fetch").clicked() {
+                        let components = self.components.clone();
+                        let error_info = self.error_info.clone();
+                        *download_store.lock().unwrap() = Download::InProgress;
+                        let egui_ctx = ctx.clone();
 
-                        if ui.button("Fetch").clicked() {
-                            let components = self.components.clone();
-                            let error_info = self.error_info.clone();
-                            *download_store.lock().unwrap() = Download::InProgress;
-                            let egui_ctx = ctx.clone();
-                            let host_part = format!("{}:{}", DEFAULT_ADDR, DEFAULT_PORT);
-                            let url = format!("http://{}/", host_part);
-
-                            let req = BrpRequest {
-                                jsonrpc: String::from("2.0"),
-                                method: String::from(BRP_QUERY_METHOD),
-                                id: Some("1".into()),
-                                params: Some(
-                                    serde_json::to_value(BrpQueryParams {
-                                        data: BrpQuery {
-                                            components: vec![],
-                                            option: vec![
-                                        "bevy_core::name::Name".to_string(),
-                                        "idle_rpg::game::alive::Health".to_string(),
-                                        "idle_rpg::game::animation::PlayerAnimation".to_string(),
-                                        "idle_rpg::game::bullets::Bullet".to_string(),
-                                        "idle_rpg::game::container::Container".to_string(),
-                                        "idle_rpg::game::enemy::Enemy".to_string(),
-                                        "bevy_core_pipeline::bloom::settings::Bloom".to_string(),
-    "bevy_core_pipeline::contrast_adaptive_sharpening::ContrastAdaptiveSharpening".to_string(),
-    "bevy_core_pipeline::core_2d::camera_2d::Camera2d".to_string(),
-    "bevy_core_pipeline::core_3d::camera_3d::Camera3d".to_string(),
-    "bevy_hierarchy::components::children::Children".to_string(),
-    "bevy_hierarchy::components::parent::Parent".to_string(),
-    "bevy_mesh::morph::MeshMorphWeights".to_string(),
-    "bevy_mesh::morph::MorphWeights".to_string(),
-    "bevy_mesh::skinning::SkinnedMesh".to_string(),
-                                        "idle_rpg::game::level::LevelEnemySpawnerTimer".to_string(),
-                                        "idle_rpg::game::level::WaveController".to_string(),
-                                        "idle_rpg::game::level::WaveId".to_string(),
-                                        "idle_rpg::game::levelup_screen::SelectedSkill".to_string(),
-                                        "idle_rpg::game::movement::MovementController".to_string(),
-                                        "idle_rpg::game::movement::ScreenWrap".to_string(),
-                                        "idle_rpg::game::pickable::DropPickable".to_string(),
-                                        "idle_rpg::game::pickable::Pickable".to_string(),
-                                        "idle_rpg::game::pickable::PickableMagnet".to_string(),
-                                        // "idle_rpg::game::pickable::SpawnPickable".to_string(),
-                                        "idle_rpg::game::player::Player".to_string(),
-                                        "idle_rpg::game::ui::KilledEnemiesDisplay".to_string(),
-                                        "idle_rpg::game::ui::PlayerHpDisplay".to_string(),
-                                        "idle_rpg::game::weapon::BaseWeapon".to_string(),
-                                        "idle_rpg::game::weapon::MeleeWeapon".to_string(),
-                                        "idle_rpg::game::weapon::PlayerTarget".to_string(),
-                                        "idle_rpg::theme::interaction::InteractionPalette".to_string(),
-                                        "bevy_text::bounds::TextBounds".to_string(),
-                                        "bevy_text::pipeline::TextLayoutInfo".to_string(),
-                                        "bevy_text::text2d::Text2d".to_string(),
-                                        "bevy_text::text::ComputedTextBlock".to_string(),
-                                        "bevy_text::text::TextColor".to_string(),
-                                        // "bevy_text::text::TextFont".to_string(),
-                                        "bevy_text::text::TextLayout".to_string(),
-                                        "bevy_text::text::TextSpan".to_string(),
-                                        "bevy_transform::components::global_transform::GlobalTransform".to_string(),
-                                        "bevy_transform::components::transform::Transform".to_string(),
-                                        "bevy_ui::focus::FocusPolicy".to_string(),
-                                        "bevy_ui::focus::Interaction".to_string(),
-                                        "bevy_ui::focus::RelativeCursorPosition".to_string(),
-                                        "bevy_ui::measurement::ContentSize".to_string(),
-                                        "bevy_ui::ui_node::BackgroundColor".to_string(),
-                                        "bevy_ui::ui_node::BorderColor".to_string(),
-                                        "bevy_ui::ui_node::BorderRadius".to_string(),
-                                        "bevy_ui::ui_node::CalculatedClip".to_string(),
-                                        "bevy_ui::ui_node::ComputedNode".to_string(),
-                                        "bevy_ui::ui_node::Node".to_string(),
-                                        "bevy_ui::ui_node::Outline".to_string(),
-                                        "bevy_ui::ui_node::ScrollPosition".to_string(),
-                                        "bevy_ui::ui_node::TargetCamera".to_string(),
-                                        "bevy_ui::ui_node::ZIndex".to_string(),
-                                        "bevy_ui::widget::button::Button".to_string(),
-                                        // "bevy_ui::widget::image::ImageNode".to_string(),
-                                        "bevy_ui::widget::image::ImageNodeSize".to_string(),
-                                        "bevy_ui::widget::label::Label".to_string(),
-                                        "bevy_ui::widget::text::Text".to_string(),
-                                        "bevy_ui::widget::text::TextNodeFlags".to_string(),
-                                        // "bevy_sprite::sprite::Sprite".to_string(),
-                                        ],
-                                            has: Vec::default(),
-                                        },
-                                        filter: BrpQueryFilter::default(),
-                                    })
-                                    .expect("Unable to convert query parameters to a valid JSON value"),
-                                ),
+                        let request = helper::make_request(
+                            &*query_param.lock().unwrap(),
+                            BRP_QUERY_METHOD,
+                            self.get_url(),
+                        );
+                        ehttp::fetch(request, move |response| {
+                            *download_store.lock().unwrap() = Download::Done;
+                            let Ok(response) = response else {
+                                *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
+                                egui_ctx.request_repaint();
+                                return;
                             };
-
-                            let request = ehttp::Request {
-                                method: "GET".to_string(),
-                                url,
-                                body: serde_json::to_string(&req).unwrap().into_bytes(),
-                                headers: Default::default(),
-                            };
-                            ehttp::fetch(request, move |response| {
-                                *download_store.lock().unwrap() = Download::Done;
-                                let Ok(response) = response else {
-                                    *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
-                                    egui_ctx.request_repaint();
-                                    return;
-                                };
-                                if response.ok {
-                                    let json = response.text().unwrap();
-                                    let result: jsonrpc_types::v2::Response =
-                                        serde_json::from_str(json).unwrap();
-                                    let jsonrpc_types::v2::Response::Single(result) = result else {
-                                        return;
-                                    };
-
-                                    let result : jsonrpc_types::Success = match result {
-                                        jsonrpc_types::Output::Success(result) => result,
-                                        jsonrpc_types::Output::Failure(e) => {
-                                            *error_info.lock().unwrap() = Some(format!("{:#?}", &e));
-                                            return;
-                                        }
-                                    };
-                                    let converted: BrpQueryResponse =
-                                        serde_json::from_value(result.result).unwrap();
-                                    *components.lock().unwrap() = converted.to_hash_map();
-                                    *error_info.lock().unwrap() = None;
-                                } else {
-                                    *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
-                                }
+                            if !response.ok {
+                                *error_info.lock().unwrap() = Some(format!("{:#?}", &response));
                                 egui_ctx.request_repaint(); // Wake up UI thread
-                            });
-                        }
-                        ui.add_space(15.0);
-                        ui.checkbox(&mut self.skip_empty_entities, "Hide empty entities");
-                    });
+                                return;
+                            }
+                            let result: BrpQueryResponse = helper::parse(&response).unwrap();
+                            *components.lock().unwrap() = result.to_hash_map();
+                            *error_info.lock().unwrap() = None;
+                            egui_ctx.request_repaint(); // Wake up UI thread
+                        });
+                    }
+                    ui.add_space(15.0);
+                    ui.checkbox(&mut self.skip_empty_entities, "Hide empty entities");
                 });
+            });
             ui.separator();
             ui.add_space(8.0);
             // });
@@ -362,7 +314,20 @@ impl eframe::App for TemplateApp {
                     .flatten()
                     .collect();
                 for e in entities.iter() {
-                    self.draw_entity(ui, e, &content);
+                    match self.draw_entity(ui, e, &content) {
+                        ActionToDo::None => {}
+                        ActionToDo::Remove => {
+                            let download_store = self.download.clone();
+                            let request = helper::make_request(
+                                &BrpDestroyParams { entity: *e },
+                                BRP_DESTROY_METHOD,
+                                self.get_url(),
+                            );
+                            ehttp::fetch(request, move |_response| {
+                                *download_store.lock().unwrap() = Download::Done;
+                            });
+                        }
+                    }
                 }
             });
             // });

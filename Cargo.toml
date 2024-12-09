@@ -15,5 +15,6 @@ eframe = { version = "0.29",  default-features = false, features = [
 ehttp = { version = "0.5"}
 jsonrpc-types = {version = "0.3.3"}
 serde_json = "1.0.133"
-bevy = { version = "0.15", default-features = false, features = ["bevy_remote"] }
+bevy = { git = "https://github.com/bevyengine/bevy", default-features = false, features = ["bevy_remote"] }
 anyhow = "1.0"
+lazy_static = "1.5.0"
