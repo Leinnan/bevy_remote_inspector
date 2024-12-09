@@ -2,7 +2,8 @@ use bevy::{
     prelude::Entity,
     remote::{
         builtin_methods::{
-            BrpDestroyParams, BrpQuery, BrpQueryFilter, BrpQueryParams, BrpQueryRow, BRP_DESTROY_METHOD, BRP_LIST_METHOD, BRP_QUERY_METHOD
+            BrpDestroyParams, BrpQuery, BrpQueryFilter, BrpQueryParams, BrpQueryRow,
+            BRP_DESTROY_METHOD, BRP_LIST_METHOD, BRP_QUERY_METHOD,
         },
         http::{DEFAULT_ADDR, DEFAULT_PORT},
     },
@@ -259,9 +260,15 @@ impl eframe::App for TemplateApp {
                                 egui_ctx.request_repaint(); // Wake up UI thread
                                 return;
                             }
-                            let result: BrpQueryResponse = helper::parse(&response).unwrap();
-                            *components.lock().unwrap() = result.to_hash_map();
-                            *error_info.lock().unwrap() = None;
+                            match helper::parse::<BrpQueryResponse>(&response) {
+                                Ok(r) => {
+                                    *components.lock().unwrap() = r.to_hash_map();
+                                    *error_info.lock().unwrap() = None;
+                                }
+                                Err(err) => {
+                                    *error_info.lock().unwrap() = Some(err);
+                                }
+                            }
                             egui_ctx.request_repaint(); // Wake up UI thread
                         });
                     }
