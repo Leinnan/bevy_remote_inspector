@@ -240,6 +240,7 @@ impl eframe::App for TemplateApp {
                     if ui.button("Fetch").clicked() {
                         let components = self.components.clone();
                         let error_info = self.error_info.clone();
+                        let query_list = self.query_list.clone();
                         *download_store.lock().unwrap() = Download::InProgress;
                         let egui_ctx = ctx.clone();
 
@@ -266,6 +267,16 @@ impl eframe::App for TemplateApp {
                                     *error_info.lock().unwrap() = None;
                                 }
                                 Err(err) => {
+                                    let mut v = query_list.lock().unwrap();
+                                    let mut s = (*v).clone().unwrap();
+                                    s.data.option = s
+                                        .data
+                                        .option
+                                        .iter()
+                                        .filter(|s| !err.contains(*s))
+                                        .map(|s| s.to_owned())
+                                        .collect();
+                                    *v = Some(s);
                                     *error_info.lock().unwrap() = Some(err);
                                 }
                             }
@@ -303,6 +314,17 @@ impl eframe::App for TemplateApp {
                             }
                         };
                         ui.add_space(15.0);
+
+                        let q = self.query_list.lock().unwrap();
+                        let Some(query) = &*q else {
+                            return;
+                        };
+                        ui.collapsing("Components list", |ui|{
+                            for e in query.data.option.iter() {
+                                ui.label(e);
+                            }
+
+                        });
                     });
                     return;
                 }
